@@ -2,8 +2,12 @@ use std::{env, process::exit};
 
 use axum::{
     Json, Router,
-    extract::ws::{Message, Utf8Bytes, WebSocket, WebSocketUpgrade},
-    response::Response,
+    extract::{
+        rejection::JsonRejection,
+        ws::{Message, Utf8Bytes, WebSocket, WebSocketUpgrade},
+    },
+    http::StatusCode,
+    response::{IntoResponse, Response},
     routing::{any, get, post},
     serve,
 };
@@ -37,11 +41,19 @@ async fn main() {
 }
 
 async fn root() -> Json<Value> {
-    Json(json!({"test": "Hello world"}))
+    Json(json!({"Hello": "world"}))
 }
 
-async fn send_message() -> Json<Value> {
-    Json(json!({"test": "Hello world"}))
+async fn send_message(body: Result<Json<Value>, JsonRejection>) -> impl IntoResponse {
+    match body {
+        Ok(data) => {
+            return (StatusCode::OK, data).into_response();
+        }
+        Err(err) => {
+            let code = StatusCode::INTERNAL_SERVER_ERROR;
+            return (code, format!("Unhandled internal error: {err}")).into_response();
+        }
+    }
 }
 
 async fn web_socket(ws: WebSocketUpgrade) -> Response {
@@ -55,7 +67,7 @@ async fn handle_socket(mut socket: WebSocket) {
         if let Ok(msg) = msg {
             match msg {
                 Message::Text(content) => {
-                    let v: Value = match serde_json::from_str(content.as_str()) {
+                    let mut v: Value = match serde_json::from_str(content.as_str()) {
                         Ok(value) => value,
                         Err(error) => {
                             println!("wrong format: {}", error);
@@ -63,11 +75,15 @@ async fn handle_socket(mut socket: WebSocket) {
                         }
                     };
 
-                    let mut send_message = Message::Text(content);
-
                     if v["token"] != sending_key {
-                        send_message = Message::Text(Utf8Bytes::from("Nice try hacker!"));
+                        let send_message = Message::Text(Utf8Bytes::from("Nice try hacker!"));
+                        socket.send(send_message).await.unwrap();
+                        return;
                     }
+
+                    v.as_object_mut().unwrap().remove("token");
+
+                    let send_message = Message::Text(Utf8Bytes::from(v.to_string()));
 
                     if socket.send(send_message).await.is_err() {
                         return;
@@ -84,8 +100,8 @@ async fn handle_socket(mut socket: WebSocket) {
                 }
                 _ => (),
             }
-        } else {
-            return;
-        };
+        }
+
+        return;
     }
 }
