@@ -1,19 +1,47 @@
+use std::{
+    collections::HashSet,
+    sync::{Arc, Mutex},
+};
+
 use axum::{
     Json, Router,
-    extract::ws::{Message, Utf8Bytes, WebSocket, WebSocketUpgrade},
-    response::Response,
+    extract::{
+        State,
+        ws::{Message, WebSocket, WebSocketUpgrade},
+    },
+    response::IntoResponse,
     routing::{any, get},
     serve,
 };
 
+use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use tokio::{select, spawn, sync::broadcast};
+
+struct AppState {
+    user_set: Mutex<HashSet<String>>,
+    tx: broadcast::Sender<String>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct SendMessage {
+    content: String,
+    from: String,
+    time: String,
+}
 
 #[tokio::main]
 async fn main() {
+    let user_set = Mutex::new(HashSet::new());
+    let (tx, _rx) = broadcast::channel(100);
+
+    let app_state = Arc::new(AppState { user_set, tx });
+
     let app = Router::new()
         .route("/", get(root))
-        .route("/ws", any(web_socket));
+        .route("/ws", any(web_socket))
+        .with_state(app_state);
 
     let listener = tokio::net::TcpListener::bind("0.0.0.0:4399").await.unwrap();
 
@@ -25,55 +53,78 @@ async fn root() -> Json<Value> {
     Json(json!({"Hello": "world"}))
 }
 
-async fn web_socket(ws: WebSocketUpgrade) -> Response {
-    ws.on_upgrade(handle_socket)
+async fn web_socket(ws: WebSocketUpgrade, State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    ws.on_upgrade(|socket| handle_socket(socket, state))
 }
 
-#[derive(Serialize, Deserialize)]
-struct SendMessage {
-    content: String,
-    from: String,
-    time: String,
-}
+async fn handle_socket(stream: WebSocket, state: Arc<AppState>) {
+    let (mut sender, mut receiver) = stream.split();
 
-async fn handle_socket(mut socket: WebSocket) {
-    while let Some(msg) = socket.recv().await {
-        let msg = match msg {
-            Ok(value) => value,
-            Err(err) => {
-                println!("[Server] Error: {}", err);
-                return;
-            }
-        };
+    let mut username = String::new();
 
-        match msg {
-            Message::Text(content) => {
-                let v: SendMessage = match serde_json::from_str(content.as_str()) {
-                    Ok(value) => value,
-                    Err(error) => {
-                        println!("wrong format: {}", error);
-                        return;
-                    }
-                };
-
-                let json_str = serde_json::to_string(&v).unwrap();
-
-                let send_message = Message::Text(Utf8Bytes::from(&json_str));
-
-                if socket.send(send_message).await.is_err() {
+    while let Some(Ok(message)) = receiver.next().await {
+        if let Message::Text(welcome_msg) = message {
+            let v: SendMessage = match serde_json::from_str(welcome_msg.as_str()) {
+                Ok(value) => value,
+                Err(error) => {
+                    let msg = Message::Text("Wrong format data. ".into());
+                    sender.send(msg).await.unwrap();
+                    println!("[Server] wrong format: {}", error);
                     return;
                 }
-            }
-            Message::Close(_) => {
-                let exit_message = Message::Text(Utf8Bytes::from("User exit"));
+            };
 
-                println!("User exit");
+            check_username(&state, &mut username, v.from.as_str());
 
-                if socket.send(exit_message).await.is_err() {
-                    return;
-                }
+            if !username.is_empty() {
+                break;
+            } else {
+                let msg = Message::Text(v.content.into());
+                sender.send(msg).await.unwrap();
             }
-            _ => (),
         }
+    }
+
+    let mut rx = state.tx.subscribe();
+
+    let msg = format!("{username} joined.");
+    state.tx.send(msg).unwrap();
+
+    let mut send_task = spawn(async move {
+        while let Ok(msg) = rx.recv().await {
+            if sender.send(Message::Text(msg.into())).await.is_err() {
+                break;
+            }
+        }
+    });
+
+    let tx = state.tx.clone();
+    let name = username.clone();
+
+    let mut recv_task = spawn(async move {
+        while let Some(Ok(Message::Text(text))) = receiver.next().await {
+            tx.send(format!("{name}: {text}")).unwrap();
+        }
+    });
+
+    select! {
+        _ = &mut send_task => recv_task.abort(),
+        _ = &mut recv_task => send_task.abort(),
+    }
+
+    let msg = format!("{username} left. ");
+
+    state.tx.send(msg).unwrap();
+
+    state.user_set.lock().unwrap().remove(&username);
+}
+
+fn check_username(state: &AppState, string: &mut String, name: &str) {
+    let mut user_set = state.user_set.lock().unwrap();
+
+    if !user_set.contains(name) {
+        user_set.insert(name.to_owned());
+
+        string.push_str(name);
     }
 }
